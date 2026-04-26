@@ -11,7 +11,6 @@ if sys.platform == "win32":
 
 import audioop
 import io
-import json
 import math
 import os
 import struct
@@ -32,14 +31,14 @@ import pyaudio
 import pyautogui
 import pyperclip
 import pystray
-from dotenv import load_dotenv
+from dotenv import load_dotenv, set_key
 from groq import Groq
 from PIL import Image, ImageDraw
 
 ICON_PATH = Path(__file__).with_name("icon.png")
-CONFIG_PATH = Path(__file__).with_name("config.json")
+ENV_PATH = Path(__file__).with_name(".env")
 
-load_dotenv()
+load_dotenv(ENV_PATH)
 
 
 def _make_tone_wav(
@@ -169,18 +168,14 @@ client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
 
 def load_trigger_key():
-    try:
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get(
-            "trigger_key", DEFAULT_TRIGGER
-        )
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return DEFAULT_TRIGGER
+    return os.environ.get("WHISPERER_TRIGGER_KEY") or DEFAULT_TRIGGER
 
 
 def save_trigger_key(key):
-    CONFIG_PATH.write_text(
-        json.dumps({"trigger_key": key}, indent=2), encoding="utf-8"
-    )
+    if not ENV_PATH.exists():
+        ENV_PATH.touch()
+    set_key(str(ENV_PATH), "WHISPERER_TRIGGER_KEY", key, quote_mode="never")
+    os.environ["WHISPERER_TRIGGER_KEY"] = key
 
 
 LOG_PATH = Path(__file__).with_name("whisperer.log")

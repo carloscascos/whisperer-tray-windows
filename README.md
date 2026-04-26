@@ -8,7 +8,7 @@ Forked from [KennyVaneetvelde/groq_whisperer](https://github.com/KennyVaneetveld
 
 - **System-tray only**: lives in the notification area, no taskbar entry, no Alt+Tab.
 - **Hold-to-talk**: hold a key (default: right Ctrl), speak, release. Transcription is copied to the clipboard and pasted at the cursor.
-- **Choose-key dialog**: right-click the tray icon → "Choose key" → press the key you want; press Esc to confirm. Saved to `config.json` (per-user, gitignored).
+- **Choose-key dialog**: right-click the tray icon → "Choose key" → press the key you want; press Esc to confirm. Persisted to `.env` (gitignored) under `WHISPERER_TRIGGER_KEY`.
 - **Audio cues**: a soft TIC when the mic opens, a TOC when it closes — tied to the actual mic state.
 - **Color states**: green (ready) / red (recording) / yellow (capturing a new key) / gray-with-slash (paused).
 - **Hallucination filtering** in three layers:
