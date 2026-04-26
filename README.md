@@ -79,6 +79,19 @@ Re-launch the tray app after editing `.env`.
 - **Mute on the call before dictating** if you don't want the other side to hear your prompts. Whisperer can't mute Teams/Zoom for you.
 - **Check `whisperer.log`** after a confusing transcription. Lines like `to API: dur=1.15s rms=906` for a hallucinated reply tell you the audio's metrics — raise `WHISPERER_MIN_RMS` if needed.
 
+## Open question: hallucination rate
+
+In a real day of dictation (98 push-to-talk calls in ~3 h, Spanish, decent USB mic), **24 of 98 calls (~25%) came back as a hallucination** — "¡Suscríbete!", "Subtítulos por la comunidad de Amara.org", "Gracias por ver el video". The phrase blocklist caught all of them before they reached the cursor, but they were still paid API calls.
+
+The audio that triggered them was not silence: typical metrics on a hallucinated call were `rms ≈ 800–900` and the audio passed the duration pre-filter. So `whisper-large-v3` is confidently returning YouTube end-credits text on audio that has voice-band energy but, for whatever reason, no recognisable speech the model can transcribe. Lowering `temperature`, switching to `verbose_json` and dropping segments on `no_speech_prob`/`avg_logprob`/`compression_ratio` does not catch these — they come back with confident metrics.
+
+**If you have solved this better, please open an issue or PR.** Things I'd be curious about:
+- A neural VAD (Silero, etc.) tuned tightly enough to reject speech-like noise without cutting soft speech.
+- Loudness normalisation before sending (e.g. to ~−20 dBFS) — does it actually move the needle?
+- A `temperature` fallback re-try on bad metrics, in the OpenAI reference style.
+- Catching hallucinations via embedding-similarity to a known set of YouTube endings, rather than exact-string match.
+- Anything else that's getting the false-positive rate well below 25% on Spanish push-to-talk.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Original work © Kenny Vaneetvelde, modifications © Carlos Cascos.
