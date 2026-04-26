@@ -1,2 +1,23 @@
-venv/
+# Secrets / runtime config
 .env
+config.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.egg-info/
+
+# App runtime
+whisperer.log
+
+# Windows
+*.lnk
+
+# Editors / tools
+.claude/
+.idea/
+.vscode/

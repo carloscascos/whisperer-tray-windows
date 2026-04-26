@@ -5,7 +5,10 @@ import pyaudio
 import keyboard
 import pyautogui
 import pyperclip
+from dotenv import load_dotenv
 from groq import Groq
+
+load_dotenv()
 
 # Set up Groq client
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -24,13 +27,13 @@ def record_audio(sample_rate=16000, channels=1, chunk=1024):
         frames_per_buffer=chunk,
     )
 
-    print("Press and hold the PAUSE button to start recording...")
+    print("Press and hold the right Ctrl key to start recording...")
     frames = []
 
-    keyboard.wait("pause")  # Wait for PAUSE button to be pressed
-    print("Recording... (Release PAUSE to stop)")
+    keyboard.wait("ctrl derecha")  # Wait for right Ctrl to be pressed
+    print("Recording... (Release right Ctrl to stop)")
 
-    while keyboard.is_pressed("pause"):
+    while keyboard.is_pressed("ctrl derecha"):
         data = stream.read(chunk)
         frames.append(data)
 
@@ -65,9 +68,8 @@ def transcribe_audio(audio_file_path):
             transcription = client.audio.transcriptions.create(
                 file=(os.path.basename(audio_file_path), file.read()),
                 model="whisper-large-v3",
-                prompt="""The audio is by a programmer discussing programming issues, the programmer mostly uses python and might mention python libraries or reference code in his speech.""",
+                prompt="""The audio is by a programmer discussing programming issues, the programmer mostly uses python and might mention python libraries or reference code in his speech. El audio puede estar en español o inglés.""",
                 response_format="text",
-                language="en",
             )
         return transcription  # This is now directly the transcription text
     except Exception as e:
@@ -108,7 +110,7 @@ def main():
         # Clean up temporary file
         os.unlink(temp_audio_file)
 
-        print("\nReady for next recording. Press PAUSE to start.")
+        print("\nReady for next recording. Press right Ctrl to start.")
 
 
 if __name__ == "__main__":
