@@ -471,7 +471,6 @@ def make_icon(active):
 
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
 
 if sys.platform == "win32":
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -491,9 +490,7 @@ def _hide_from_taskbar(icon):
             time.sleep(0.1)
         if hwnd:
             ex = _user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-            _user32.SetWindowLongW(
-                hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-            )
+            _user32.SetWindowLongW(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW)
     icon.visible = True
 
 
