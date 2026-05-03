@@ -591,7 +591,7 @@ class TrayApp:
         return f"Choose key ({self.trigger_key})"
 
     def _language_label(self, _item):
-        return f"Language: {self._language_display(self.language)}"
+        return f"Target language: {self._language_display(self.language)}"
 
     def _on_keyboard_event(self, event):
         if self._capturing:
