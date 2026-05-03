@@ -99,8 +99,18 @@ MIN_RMS = _env_float("WHISPERER_MIN_RMS", 250)
 MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
-LANGUAGE_ALT = os.environ.get("WHISPERER_LANGUAGE_ALT", "")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
+
+
+def _parse_languages():
+    raw = os.environ.get("WHISPERER_LANGUAGES", "")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    if parts:
+        return parts
+    return [LANGUAGE] if LANGUAGE else []
+
+
+LANGUAGES = _parse_languages()
 
 HALLUCINATION_SUBSTRINGS = ("amara.org",)
 HALLUCINATION_PHRASES = {
@@ -506,7 +516,7 @@ class TrayApp:
     def __init__(self):
         self.enabled = True
         self.trigger_key = load_trigger_key()
-        self.language = LANGUAGE
+        self.language = LANGUAGES[0] if LANGUAGES else ""
         self._languages = self._build_language_list()
         self._capturing = False
         self._hook_installed = False
@@ -520,9 +530,9 @@ class TrayApp:
         )
 
     def _build_language_list(self):
-        if not LANGUAGE_ALT or LANGUAGE_ALT == LANGUAGE:
-            return [LANGUAGE]
-        return ["", LANGUAGE, LANGUAGE_ALT]
+        if len(LANGUAGES) <= 1:
+            return LANGUAGES
+        return [""] + LANGUAGES
 
     def _language_display(self, lang):
         return "Auto (detect)" if lang == "" else lang.upper()
