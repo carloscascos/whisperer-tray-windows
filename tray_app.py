@@ -96,6 +96,7 @@ CHANNELS = 1
 CHUNK = 1024
 MIN_DURATION_SEC = _env_float("WHISPERER_MIN_DURATION_SEC", 0.4)
 MIN_RMS = _env_float("WHISPERER_MIN_RMS", 250)
+MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
@@ -293,10 +294,13 @@ class TkBackend:
 
 
 class Recorder:
+    _MAX_SAMPLES = int(MAX_RECORDING_SEC * SAMPLE_RATE)
+
     def __init__(self):
         self._audio = pyaudio.PyAudio()
         self._stream = None
         self._frames = []
+        self._sample_count = 0
         self._lock = threading.Lock()
 
     def start(self):
@@ -305,6 +309,7 @@ class Recorder:
             if self._stream is not None:
                 return
             self._frames = []
+            self._sample_count = 0
             self._stream = self._audio.open(
                 format=pyaudio.paInt16,
                 channels=CHANNELS,
@@ -319,7 +324,12 @@ class Recorder:
             _play_async(_TIC_WAV)
 
     def _on_data(self, in_data, frame_count, time_info, status):
-        self._frames.append(in_data)
+        if self._sample_count < self._MAX_SAMPLES:
+            self._frames.append(in_data)
+            self._sample_count += frame_count
+            if self._sample_count >= self._MAX_SAMPLES:
+                log(f"recording cap hit: {MAX_RECORDING_SEC}s")
+                _play_async(_TOC_WAV)
         return (in_data, pyaudio.paContinue)
 
     def stop(self):
