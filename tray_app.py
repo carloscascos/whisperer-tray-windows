@@ -399,8 +399,12 @@ def transcribe_and_paste(frames):
             log(f"skip transcribe: hallucination {text!r}")
             text = ""
         if text:
+            prev_clipboard = pyperclip.paste()
             pyperclip.copy(text)
             pyautogui.hotkey("ctrl", "v")
+            if prev_clipboard:
+                time.sleep(0.2)
+                pyperclip.copy(prev_clipboard)
     except Exception as e:
         print(f"Transcription error: {e}", file=sys.stderr)
     finally:
