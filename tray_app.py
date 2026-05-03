@@ -99,6 +99,7 @@ MIN_RMS = _env_float("WHISPERER_MIN_RMS", 250)
 MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
+LANGUAGE_ALT = os.environ.get("WHISPERER_LANGUAGE_ALT", "")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
 
 HALLUCINATION_SUBSTRINGS = ("amara.org",)
@@ -355,7 +356,7 @@ def build_wav(raw):
     return buf.getvalue()
 
 
-def transcribe_and_paste(frames):
+def transcribe_and_paste(frames, language):
     if not frames:
         return
     raw = b"".join(frames)
@@ -367,14 +368,14 @@ def transcribe_and_paste(frames):
     if rms < MIN_RMS:
         log(f"skip transcribe: too quiet (rms={rms}, dur={duration:.2f}s)")
         return
-    log(f"to API: dur={duration:.2f}s rms={rms}")
+    log(f"to API: dur={duration:.2f}s rms={rms} lang={language}")
     wav_bytes = build_wav(raw)
     try:
         response = client.audio.transcriptions.create(
             file=("audio.wav", wav_bytes),
             model="whisper-large-v3",
             prompt=PROMPT,
-            language=LANGUAGE,
+            language=language,
             response_format="verbose_json",
             temperature=0,
         )
@@ -503,6 +504,8 @@ class TrayApp:
     def __init__(self):
         self.enabled = True
         self.trigger_key = load_trigger_key()
+        self.language = LANGUAGE
+        self._languages = self._build_language_list()
         self._capturing = False
         self._hook_installed = False
         self.recorder = Recorder()
@@ -511,24 +514,70 @@ class TrayApp:
             "groq_whisperer",
             make_icon(self.enabled),
             self._tooltip(),
-            menu=pystray.Menu(
-                pystray.MenuItem(self._toggle_label, self.on_toggle, default=True),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem(self._choose_key_label, self.on_choose_key),
+            menu=pystray.Menu(*self._build_menu_items()),
+        )
+
+    def _build_language_list(self):
+        langs = [LANGUAGE]
+        if LANGUAGE_ALT and LANGUAGE_ALT != LANGUAGE:
+            langs.append(LANGUAGE_ALT)
+        return langs
+
+    def _build_menu_items(self):
+        items = [
+            pystray.MenuItem(self._toggle_label, self.on_toggle, default=True),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(self._choose_key_label, self.on_choose_key),
+        ]
+        if len(self._languages) > 1:
+            items.append(
+                pystray.MenuItem(
+                    self._language_label,
+                    pystray.Menu(*self._language_submenu_items()),
+                )
+            )
+        items.extend(
+            [
                 pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", self.on_quit),
-            ),
+            ]
         )
+        return items
+
+    def _language_submenu_items(self):
+        return [
+            pystray.MenuItem(
+                lang.upper(),
+                self._make_language_handler(lang),
+                checked=lambda item, l=lang: self.language == l,
+                radio=True,
+            )
+            for lang in self._languages
+        ]
+
+    def _make_language_handler(self, lang):
+        def handler(icon, _item):
+            self.language = lang
+            icon.title = self._tooltip()
+            icon.update_menu()
+
+        return handler
 
     def _tooltip(self):
         state = "active" if self.enabled else "paused"
-        return f"Groq Whisperer ({state}) — hold {self.trigger_key}"
+        base = f"Groq Whisperer ({state}) — hold {self.trigger_key}"
+        if len(self._languages) > 1:
+            base += f" — lang: {self.language.upper()}"
+        return base
 
     def _toggle_label(self, _item):
         return "Stop Whisperer" if self.enabled else "Activate Whisperer"
 
     def _choose_key_label(self, _item):
         return f"Choose key ({self.trigger_key})"
+
+    def _language_label(self, _item):
+        return f"Language: {self.language.upper()}"
 
     def _on_keyboard_event(self, event):
         if self._capturing:
@@ -559,7 +608,9 @@ class TrayApp:
         frames = self.recorder.stop()
         if frames:
             threading.Thread(
-                target=transcribe_and_paste, args=(frames,), daemon=True
+                target=transcribe_and_paste,
+                args=(frames, self.language),
+                daemon=True,
             ).start()
 
     def on_toggle(self, icon, _item):
