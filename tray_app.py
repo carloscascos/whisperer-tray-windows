@@ -368,17 +368,19 @@ def transcribe_and_paste(frames, language):
     if rms < MIN_RMS:
         log(f"skip transcribe: too quiet (rms={rms}, dur={duration:.2f}s)")
         return
-    log(f"to API: dur={duration:.2f}s rms={rms} lang={language}")
+    log(f"to API: dur={duration:.2f}s rms={rms} lang={language or 'auto'}")
     wav_bytes = build_wav(raw)
     try:
-        response = client.audio.transcriptions.create(
-            file=("audio.wav", wav_bytes),
-            model="whisper-large-v3",
-            prompt=PROMPT,
-            language=language,
-            response_format="verbose_json",
-            temperature=0,
-        )
+        api_kwargs = {
+            "file": ("audio.wav", wav_bytes),
+            "model": "whisper-large-v3",
+            "prompt": PROMPT,
+            "response_format": "verbose_json",
+            "temperature": 0,
+        }
+        if language:
+            api_kwargs["language"] = language
+        response = client.audio.transcriptions.create(**api_kwargs)
         segments = getattr(response, "segments", None) or []
         if segments:
             kept = []
@@ -518,10 +520,12 @@ class TrayApp:
         )
 
     def _build_language_list(self):
-        langs = [LANGUAGE]
-        if LANGUAGE_ALT and LANGUAGE_ALT != LANGUAGE:
-            langs.append(LANGUAGE_ALT)
-        return langs
+        if not LANGUAGE_ALT or LANGUAGE_ALT == LANGUAGE:
+            return [LANGUAGE]
+        return ["", LANGUAGE, LANGUAGE_ALT]
+
+    def _language_display(self, lang):
+        return "Auto (detect)" if lang == "" else lang.upper()
 
     def _build_menu_items(self):
         items = [
@@ -547,7 +551,7 @@ class TrayApp:
     def _language_submenu_items(self):
         return [
             pystray.MenuItem(
-                lang.upper(),
+                self._language_display(lang),
                 self._make_language_handler(lang),
                 checked=lambda item, l=lang: self.language == l,
                 radio=True,
@@ -567,7 +571,7 @@ class TrayApp:
         state = "active" if self.enabled else "paused"
         base = f"Groq Whisperer ({state}) — hold {self.trigger_key}"
         if len(self._languages) > 1:
-            base += f" — lang: {self.language.upper()}"
+            base += f" — lang: {self._language_display(self.language)}"
         return base
 
     def _toggle_label(self, _item):
@@ -577,7 +581,7 @@ class TrayApp:
         return f"Choose key ({self.trigger_key})"
 
     def _language_label(self, _item):
-        return f"Language: {self.language.upper()}"
+        return f"Language: {self._language_display(self.language)}"
 
     def _on_keyboard_event(self, event):
         if self._capturing:
