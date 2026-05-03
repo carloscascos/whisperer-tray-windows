@@ -388,6 +388,9 @@ def transcribe_and_paste(frames):
                 if comp > 2.4:
                     log(f"drop seg (compression): {seg_text!r} cr={comp:.2f}")
                     continue
+                if seg_text and is_hallucination(seg_text):
+                    log(f"drop seg (hallucination): {seg_text!r}")
+                    continue
                 kept.append(seg_text)
             text = " ".join(kept).strip()
         else:
