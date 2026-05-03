@@ -101,6 +101,9 @@ MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
 
+MODEL_NORMAL = "whisper-large-v3"
+MODEL_TURBO = "whisper-large-v3-turbo"
+
 
 def _parse_languages():
     raw = os.environ.get("WHISPERER_LANGUAGES", "")
@@ -366,7 +369,7 @@ def build_wav(raw):
     return buf.getvalue()
 
 
-def transcribe_and_paste(frames, language):
+def transcribe_and_paste(frames, language, model):
     if not frames:
         return
     raw = b"".join(frames)
@@ -378,12 +381,12 @@ def transcribe_and_paste(frames, language):
     if rms < MIN_RMS:
         log(f"skip transcribe: too quiet (rms={rms}, dur={duration:.2f}s)")
         return
-    log(f"to API: dur={duration:.2f}s rms={rms} lang={language or 'auto'}")
+    log(f"to API: dur={duration:.2f}s rms={rms} lang={language or 'auto'} model={model}")
     wav_bytes = build_wav(raw)
     try:
         api_kwargs = {
             "file": ("audio.wav", wav_bytes),
-            "model": "whisper-large-v3",
+            "model": model,
             "prompt": PROMPT,
             "response_format": "verbose_json",
             "temperature": 0,
@@ -518,6 +521,7 @@ class TrayApp:
         self.trigger_key = load_trigger_key()
         self.language = LANGUAGES[0] if LANGUAGES else ""
         self._languages = self._build_language_list()
+        self.turbo = False
         self._capturing = False
         self._hook_installed = False
         self.recorder = Recorder()
@@ -550,6 +554,13 @@ class TrayApp:
                     pystray.Menu(*self._language_submenu_items()),
                 )
             )
+        items.append(
+            pystray.MenuItem(
+                "Turbo model (faster, cheaper)",
+                self.on_toggle_turbo,
+                checked=lambda _item: self.turbo,
+            )
+        )
         items.extend(
             [
                 pystray.Menu.SEPARATOR,
@@ -557,6 +568,10 @@ class TrayApp:
             ]
         )
         return items
+
+    def on_toggle_turbo(self, icon, _item):
+        self.turbo = not self.turbo
+        icon.update_menu()
 
     def _language_submenu_items(self):
         return [
@@ -621,9 +636,10 @@ class TrayApp:
             pass
         frames = self.recorder.stop()
         if frames:
+            model = MODEL_TURBO if self.turbo else MODEL_NORMAL
             threading.Thread(
                 target=transcribe_and_paste,
-                args=(frames, self.language),
+                args=(frames, self.language, model),
                 daemon=True,
             ).start()
 
