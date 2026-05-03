@@ -521,7 +521,7 @@ class TrayApp:
         self.trigger_key = load_trigger_key()
         self.language = LANGUAGES[0] if LANGUAGES else ""
         self._languages = self._build_language_list()
-        self.turbo = False
+        self.turbo = True
         self._capturing = False
         self._hook_installed = False
         self.recorder = Recorder()
