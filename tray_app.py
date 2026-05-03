@@ -14,7 +14,6 @@ import io
 import math
 import os
 import struct
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -336,15 +335,14 @@ class Recorder:
         return frames
 
 
-def write_wav(raw):
-    fd, path = tempfile.mkstemp(suffix=".wav")
-    os.close(fd)
-    with wave.open(path, "wb") as wf:
+def build_wav(raw):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(raw)
-    return path
+    return buf.getvalue()
 
 
 def transcribe_and_paste(frames):
@@ -360,17 +358,16 @@ def transcribe_and_paste(frames):
         log(f"skip transcribe: too quiet (rms={rms}, dur={duration:.2f}s)")
         return
     log(f"to API: dur={duration:.2f}s rms={rms}")
-    path = write_wav(raw)
+    wav_bytes = build_wav(raw)
     try:
-        with open(path, "rb") as f:
-            response = client.audio.transcriptions.create(
-                file=(os.path.basename(path), f.read()),
-                model="whisper-large-v3",
-                prompt=PROMPT,
-                language=LANGUAGE,
-                response_format="verbose_json",
-                temperature=0,
-            )
+        response = client.audio.transcriptions.create(
+            file=("audio.wav", wav_bytes),
+            model="whisper-large-v3",
+            prompt=PROMPT,
+            language=LANGUAGE,
+            response_format="verbose_json",
+            temperature=0,
+        )
         segments = getattr(response, "segments", None) or []
         if segments:
             kept = []
@@ -407,11 +404,6 @@ def transcribe_and_paste(frames):
                 pyperclip.copy(prev_clipboard)
     except Exception as e:
         print(f"Transcription error: {e}", file=sys.stderr)
-    finally:
-        try:
-            os.unlink(path)
-        except OSError:
-            pass
 
 
 ACTIVE_COLOR = (40, 200, 80, 255)
