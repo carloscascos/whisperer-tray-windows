@@ -532,6 +532,7 @@ class TrayApp:
         self.turbo = True
         self._capturing = False
         self._hook_installed = False
+        self._key_down = False
         self.last_text = ""
         self.recorder = Recorder()
         self._tk = TkBackend()
@@ -660,8 +661,14 @@ class TrayApp:
         if event.name != self.trigger_key:
             return
         if event.event_type == "down":
+            if self._key_down:
+                return
+            self._key_down = True
             self.on_press(event)
         elif event.event_type == "up":
+            if not self._key_down:
+                return
+            self._key_down = False
             self.on_release(event)
 
     def on_press(self, _event):
