@@ -19,6 +19,7 @@ import time
 import tkinter as tk
 import unicodedata
 import wave
+import webbrowser
 from ctypes import wintypes
 from pathlib import Path
 
@@ -103,6 +104,8 @@ PROMPT = os.environ.get("WHISPERER_PROMPT", "")
 
 MODEL_NORMAL = "whisper-large-v3"
 MODEL_TURBO = "whisper-large-v3-turbo"
+
+GROQ_USAGE_URL = "https://console.groq.com/dashboard/usage"
 
 
 def _parse_languages():
@@ -369,7 +372,7 @@ def build_wav(raw):
     return buf.getvalue()
 
 
-def transcribe_and_paste(frames, language, model):
+def transcribe_and_paste(frames, language, model, on_text=None):
     if not frames:
         return
     raw = b"".join(frames)
@@ -422,6 +425,11 @@ def transcribe_and_paste(frames, language, model):
             log(f"skip transcribe: hallucination {text!r}")
             text = ""
         if text:
+            if on_text is not None:
+                try:
+                    on_text(text)
+                except Exception as e:
+                    log(f"on_text callback failed: {e!r}")
             prev_clipboard = pyperclip.paste()
             pyperclip.copy(text)
             pyautogui.hotkey("ctrl", "v")
@@ -524,6 +532,7 @@ class TrayApp:
         self.turbo = True
         self._capturing = False
         self._hook_installed = False
+        self.last_text = ""
         self.recorder = Recorder()
         self._tk = TkBackend()
         self.icon = pystray.Icon(
@@ -564,10 +573,47 @@ class TrayApp:
         items.extend(
             [
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem(
+                    self._copy_last_label,
+                    self.on_copy_last,
+                    enabled=lambda _item: bool(self.last_text),
+                ),
+                pystray.MenuItem("Groq usage dashboard", self.on_open_usage),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Exit", self.on_quit),
             ]
         )
         return items
+
+    def _copy_last_label(self, _item):
+        if not self.last_text:
+            return "Copy last transcription"
+        preview = self.last_text[:40].replace("\n", " ")
+        if len(self.last_text) > 40:
+            preview += "..."
+        return f'Copy last: "{preview}"'
+
+    def on_copy_last(self, _icon, _item):
+        if not self.last_text:
+            return
+        try:
+            pyperclip.copy(self.last_text)
+            log(f"copied last transcription ({len(self.last_text)} chars)")
+        except Exception as e:
+            log(f"copy last failed: {e!r}")
+
+    def _set_last_text(self, text):
+        self.last_text = text
+        try:
+            self.icon.update_menu()
+        except Exception as e:
+            log(f"update_menu after transcript failed: {e!r}")
+
+    def on_open_usage(self, _icon, _item):
+        try:
+            webbrowser.open(GROQ_USAGE_URL, new=2)
+        except Exception as e:
+            log(f"open usage failed: {e!r}")
 
     def on_toggle_turbo(self, icon, _item):
         self.turbo = not self.turbo
@@ -639,7 +685,7 @@ class TrayApp:
             model = MODEL_TURBO if self.turbo else MODEL_NORMAL
             threading.Thread(
                 target=transcribe_and_paste,
-                args=(frames, self.language, model),
+                args=(frames, self.language, model, self._set_last_text),
                 daemon=True,
             ).start()
 
