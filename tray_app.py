@@ -13,6 +13,7 @@ import audioop
 import io
 import math
 import os
+import re
 import struct
 import threading
 import time
@@ -102,6 +103,29 @@ MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
 
+
+def _parse_replacements(raw):
+    """Parse 'origen => destino' rules (one per line) into compiled regexes."""
+    rules = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line or "=>" not in line:
+            continue
+        src, _, tgt = line.partition("=>")
+        src, tgt = src.strip(), tgt.strip()
+        if src:
+            rules.append((re.compile(r"\b" + re.escape(src) + r"\b", re.IGNORECASE), tgt))
+    return rules
+
+
+REPLACEMENTS = _parse_replacements(os.environ.get("WHISPERER_REPLACEMENTS", ""))
+
+
+def apply_replacements(text):
+    for pattern, repl in REPLACEMENTS:
+        text = pattern.sub(repl, text)
+    return text
+
 MODEL_NORMAL = "whisper-large-v3"
 MODEL_TURBO = "whisper-large-v3-turbo"
 
@@ -182,6 +206,15 @@ def _seg_attr(seg, name, default):
     return default if val is None else val
 
 client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+
+
+def reload_prompt():
+    """Re-read prompt + replacement rules from .env without restarting."""
+    global PROMPT, REPLACEMENTS
+    load_dotenv(ENV_PATH, override=True)
+    PROMPT = os.environ.get("WHISPERER_PROMPT", "")
+    REPLACEMENTS = _parse_replacements(os.environ.get("WHISPERER_REPLACEMENTS", ""))
+    return PROMPT
 
 
 def load_trigger_key():
@@ -425,6 +458,7 @@ def transcribe_and_paste(frames, language, model, on_text=None):
             log(f"skip transcribe: hallucination {text!r}")
             text = ""
         if text:
+            text = apply_replacements(text)
             if on_text is not None:
                 try:
                     on_text(text)
@@ -500,11 +534,46 @@ WS_EX_TOOLWINDOW = 0x00000080
 WS_EX_NOACTIVATE = 0x08000000
 
 if sys.platform == "win32":
+    from pystray._util import win32 as _pswin32
+
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _user32.GetWindowLongW.restype = ctypes.c_long
     _user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
     _user32.SetWindowLongW.restype = ctypes.c_long
     _user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_long]
+
+
+class WhispererIcon(pystray.Icon):
+    """Tray icon with swapped mouse buttons on Windows.
+
+    pystray's default is left-click = default menu item, right-click = menu.
+    We swap them: left-click opens the menu, right-click runs the default
+    action (toggle Whisperer).
+    """
+
+    def _on_notify(self, wparam, lparam):
+        if sys.platform != "win32":
+            return super()._on_notify(wparam, lparam)
+        if lparam == _pswin32.WM_RBUTTONUP:
+            self()
+        elif self._menu_handle and lparam == _pswin32.WM_LBUTTONUP:
+            # TrackPopupMenuEx misbehaves unless our systray window is foreground
+            _pswin32.SetForegroundWindow(self._hwnd)
+            point = wintypes.POINT()
+            _pswin32.GetCursorPos(ctypes.byref(point))
+            hmenu, descriptors = self._menu_handle
+            index = _pswin32.TrackPopupMenuEx(
+                hmenu,
+                _pswin32.TPM_RIGHTALIGN
+                | _pswin32.TPM_BOTTOMALIGN
+                | _pswin32.TPM_RETURNCMD,
+                point.x,
+                point.y,
+                self._menu_hwnd,
+                None,
+            )
+            if index > 0:
+                descriptors[index - 1](self)
 
 
 def _hide_from_taskbar(icon):
@@ -536,7 +605,7 @@ class TrayApp:
         self.last_text = ""
         self.recorder = Recorder()
         self._tk = TkBackend()
-        self.icon = pystray.Icon(
+        self.icon = WhispererIcon(
             "groq_whisperer",
             make_icon(self.enabled),
             self._tooltip(),
@@ -698,7 +767,13 @@ class TrayApp:
 
     def on_toggle(self, icon, _item):
         self.enabled = not self.enabled
-        if not self.enabled:
+        if self.enabled:
+            new_prompt = reload_prompt()
+            log(
+                f"reloaded on start: prompt {len(new_prompt)} chars, "
+                f"{len(REPLACEMENTS)} replacement rule(s)"
+            )
+        else:
             self.recorder.stop()
         icon.icon = make_icon(self.enabled)
         icon.title = self._tooltip()
