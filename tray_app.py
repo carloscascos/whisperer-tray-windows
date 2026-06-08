@@ -105,9 +105,9 @@ PROMPT = os.environ.get("WHISPERER_PROMPT", "")
 
 
 def _parse_replacements(raw):
-    """Parse 'origen => destino' rules (one per line) into compiled regexes."""
+    """Parse 'origen => destino' rules (split on newline or comma)."""
     rules = []
-    for line in (raw or "").splitlines():
+    for line in re.split(r"[\n,]", raw or ""):
         line = line.strip()
         if not line or "=>" not in line:
             continue
