@@ -43,8 +43,10 @@ load_dotenv(ENV_PATH)
 
 
 def _make_tone_wav(
-    freq_hz, ms, sample_rate=22050, volume=6000, attack_ms=4, release_ms=15
+    freq_hz, ms, sample_rate=22050, volume=6000, attack_ms=4, release_ms=15,
+    lead_ms=0, tail_ms=0, lead_volume=0,
 ):
+    lead = int(sample_rate * lead_ms / 1000)
     n = int(sample_rate * ms / 1000)
     attack = max(1, int(sample_rate * attack_ms / 1000))
     release = max(1, int(sample_rate * release_ms / 1000))
@@ -53,6 +55,12 @@ def _make_tone_wav(
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(sample_rate)
+        # The lead pad carries the tone at near-inaudible level rather than
+        # pure zeros: silent samples can be optimized away, so they don't
+        # reliably wake a sleeping Bluetooth link.
+        for i in range(lead):
+            v = int(lead_volume * math.sin(2 * math.pi * freq_hz * i / sample_rate))
+            w.writeframesraw(struct.pack("<h", v))
         for i in range(n):
             if i < attack:
                 env = i / attack
@@ -62,22 +70,76 @@ def _make_tone_wav(
                 env = 1.0
             v = int(volume * env * math.sin(2 * math.pi * freq_hz * i / sample_rate))
             w.writeframesraw(struct.pack("<h", v))
+        w.writeframesraw(b"\x00\x00" * int(sample_rate * tail_ms / 1000))
     return buf.getvalue()
 
 
-_TIC_WAV = _make_tone_wav(420, 90) if sys.platform == "win32" else b""
-_TOC_WAV = _make_tone_wav(350, 130) if sys.platform == "win32" else b""
+# Bluetooth outputs sleep between sounds and swallow (or clip into a click)
+# the first few hundred ms of playback while the link wakes up. Each cue
+# carries ~500ms of near-inaudible lead tone to wake the link with real
+# audio, then fades in gently so a late link entry never clicks.
+_TIC_WAV = (
+    _make_tone_wav(420, 200, attack_ms=60, lead_ms=500, tail_ms=80, lead_volume=80)
+    if sys.platform == "win32" else b""
+)
+# The stop cue plays while the headset is switching back from hands-free to
+# music mode, whose endpoint re-activation pops: longer quiet lead and a
+# slower fade-in absorb it. (Fallback path only — normally the stop cue goes
+# out through the still-open hands-free link, see Recorder._play_toc_hfp.)
+_TOC_WAV = (
+    _make_tone_wav(350, 200, attack_ms=100, lead_ms=800, tail_ms=80, lead_volume=80)
+    if sys.platform == "win32" else b""
+)
 
 
-def _play_async(blob):
+def _make_tone_raw(freq_hz, ms, sample_rate=22050, volume=6000,
+                   attack_ms=30, release_ms=30, tail_ms=80):
+    """Raw PCM frames (no WAV container) for pyaudio playback."""
+    n = int(sample_rate * ms / 1000)
+    attack = max(1, int(sample_rate * attack_ms / 1000))
+    release = max(1, int(sample_rate * release_ms / 1000))
+    out = bytearray()
+    for i in range(n):
+        if i < attack:
+            env = i / attack
+        elif i > n - release:
+            env = max(0.0, (n - i) / release)
+        else:
+            env = 1.0
+        out += struct.pack(
+            "<h", int(volume * env * math.sin(2 * math.pi * freq_hz * i / sample_rate))
+        )
+    out += b"\x00\x00" * int(sample_rate * tail_ms / 1000)
+    return bytes(out)
+
+
+# The hands-free channel is 16kHz narrowband and plays quieter than the
+# music channel: generate at its native rate (resampling smears the tone
+# into a faint buzz), louder, and as a double beep so it is unmistakable.
+_TOC_RAW_RATE = 16000
+_TOC_RAW = (
+    _make_tone_raw(550, 120, sample_rate=_TOC_RAW_RATE, volume=18000, tail_ms=70)
+    + _make_tone_raw(550, 120, sample_rate=_TOC_RAW_RATE, volume=18000, tail_ms=100)
+)
+
+
+def _play_sync(blob):
+    if sys.platform != "win32" or not blob:
+        return
+    try:
+        winsound.PlaySound(blob, winsound.SND_MEMORY)
+    except Exception:
+        pass
+
+
+def _play_async(blob, delay=0.0):
     if sys.platform != "win32" or not blob:
         return
 
     def _play():
-        try:
-            winsound.PlaySound(blob, winsound.SND_MEMORY)
-        except Exception:
-            pass
+        if delay:
+            time.sleep(delay)
+        _play_sync(blob)
 
     threading.Thread(target=_play, daemon=True).start()
 
@@ -99,6 +161,11 @@ CHUNK = 1024
 MIN_DURATION_SEC = _env_float("WHISPERER_MIN_DURATION_SEC", 0.4)
 MIN_RMS = _env_float("WHISPERER_MIN_RMS", 250)
 MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
+# Bluetooth headsets switch profiles (A2DP <-> HFP) when the mic opens or
+# closes, leaving a dead window where sounds routed to the default output are
+# dropped. The start cue must play BEFORE the mic opens; the stop cue must
+# wait until the headset has switched back, which takes over a second.
+TOC_DELAY_SEC = _env_float("WHISPERER_TOC_DELAY_SEC", 0.6)
 
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
@@ -343,6 +410,49 @@ class TkBackend:
 
 
 
+def scan_input_device(pa):
+    """Pick the mic to record from. Preference order: WHISPERER_INPUT_DEVICE
+    (name substring) if set, else the first Bluetooth hands-free mic (Windows
+    names these "Headset (...)"), else the system default. MME host API only,
+    to see each physical device once."""
+    want = (os.environ.get("WHISPERER_INPUT_DEVICE") or "").strip().lower()
+    headset = None
+    try:
+        for i in range(pa.get_device_count()):
+            d = pa.get_device_info_by_index(i)
+            if d.get("maxInputChannels", 0) < 1:
+                continue
+            if pa.get_host_api_info_by_index(d["hostApi"])["name"] != "MME":
+                continue
+            name = str(d.get("name", ""))
+            if want and want in name.lower():
+                return i, name
+            if headset is None and name.lower().startswith("headset ("):
+                headset = (i, name)
+    except Exception as e:
+        log(f"device scan failed: {e!r}")
+    if want:
+        log(f"input device {want!r} not found; using auto/default")
+    return headset if headset else (None, "system default")
+
+
+def current_devices():
+    """Return (mic_name, output_name) as they would be used right now."""
+    try:
+        pa = pyaudio.PyAudio()
+        try:
+            _, mic = scan_input_device(pa)
+            if mic == "system default":
+                mic = str(pa.get_default_input_device_info()["name"])
+            out = str(pa.get_default_output_device_info()["name"])
+        finally:
+            pa.terminate()
+        return mic, out
+    except Exception as e:
+        log(f"device status failed: {e!r}")
+        return "?", "?"
+
+
 class Recorder:
     _MAX_SAMPLES = int(MAX_RECORDING_SEC * SAMPLE_RATE)
 
@@ -351,27 +461,88 @@ class Recorder:
         self._stream = None
         self._frames = []
         self._sample_count = 0
+        self._was_headset = False
         self._lock = threading.Lock()
 
+    def _pick_input_device(self):
+        """Choose the input device for this recording, hot-plug aware.
+
+        Recreates the PyAudio instance because it snapshots the device list
+        at construction — without this, a headset connected after app start
+        is invisible.
+        """
+        try:
+            self._audio.terminate()
+        except Exception:
+            pass
+        self._audio = pyaudio.PyAudio()
+        return scan_input_device(self._audio)
+
+    def _open_stream(self, device_index):
+        return self._audio.open(
+            format=pyaudio.paInt16,
+            channels=CHANNELS,
+            rate=SAMPLE_RATE,
+            input=True,
+            input_device_index=device_index,
+            frames_per_buffer=CHUNK,
+            stream_callback=self._on_data,
+        )
+
     def start(self):
-        opened = False
         with self._lock:
             if self._stream is not None:
                 return
+            device_index, device_name = self._pick_input_device()
+            # Play the start cue before opening the mic: opening a Bluetooth
+            # mic switches the headset to hands-free mode, which mutes normal
+            # output, so playing it after means it is never heard.
+            _play_sync(_TIC_WAV)
             self._frames = []
             self._sample_count = 0
-            self._stream = self._audio.open(
-                format=pyaudio.paInt16,
-                channels=CHANNELS,
-                rate=SAMPLE_RATE,
-                input=True,
-                frames_per_buffer=CHUNK,
-                stream_callback=self._on_data,
-            )
+            try:
+                self._stream = self._open_stream(device_index)
+            except Exception as e:
+                if device_index is None:
+                    raise
+                log(f"open {device_name!r} failed ({e!r}); using default mic")
+                device_index, device_name = None, "system default"
+                self._stream = self._open_stream(None)
+            log(f"recording from: {device_name}")
+            self._was_headset = device_name.lower().startswith("headset (")
             self._stream.start_stream()
-            opened = True
-        if opened:
-            _play_async(_TIC_WAV)
+
+    def _play_toc_hfp(self):
+        """Play the stop cue through the headset's hands-free output while
+        the link is still in hands-free mode — instant and click-free,
+        instead of waiting for the switch back to music mode."""
+        try:
+            idx = None
+            for i in range(self._audio.get_device_count()):
+                d = self._audio.get_device_info_by_index(i)
+                if d.get("maxOutputChannels", 0) < 1:
+                    continue
+                if self._audio.get_host_api_info_by_index(d["hostApi"])["name"] != "MME":
+                    continue
+                if str(d.get("name", "")).lower().startswith("headset ("):
+                    idx = i
+                    break
+            if idx is None:
+                return False
+            out = self._audio.open(
+                format=pyaudio.paInt16, channels=1, rate=_TOC_RAW_RATE,
+                output=True, output_device_index=idx,
+            )
+            out.write(_TOC_RAW)
+            # write() returns when the buffers are queued, not played;
+            # stopping right away discards the queued audio unplayed.
+            time.sleep(len(_TOC_RAW) / (2 * _TOC_RAW_RATE) + 0.1)
+            out.stop_stream()
+            out.close()
+            return True
+        except Exception as e:
+            log(f"hfp toc failed: {e!r}")
+            return False
 
     def _on_data(self, in_data, frame_count, time_info, status):
         if self._sample_count < self._MAX_SAMPLES:
@@ -384,14 +555,22 @@ class Recorder:
 
     def stop(self):
         frames = None
+        toc_played = False
         with self._lock:
             if self._stream is None:
                 return None
+            # Cue first, then close: while the mic is open the hands-free
+            # link is up, so the cue plays immediately on the headset.
+            if self._was_headset:
+                toc_played = self._play_toc_hfp()
             self._stream.stop_stream()
             self._stream.close()
             self._stream = None
             frames = self._frames
-        _play_async(_TOC_WAV)
+        if not toc_played:
+            _play_async(
+                _TOC_WAV, delay=TOC_DELAY_SEC if self._was_headset else 0.0
+            )
         return frames
 
 
@@ -603,6 +782,8 @@ class TrayApp:
         self._hook_installed = False
         self._key_down = False
         self.last_text = ""
+        self._devices_cache = ("?", "?")
+        self._devices_at = 0.0
         self.recorder = Recorder()
         self._tk = TkBackend()
         self.icon = WhispererIcon(
@@ -620,8 +801,26 @@ class TrayApp:
     def _language_display(self, lang):
         return "Auto (detect)" if lang == "" else lang.upper()
 
+    def _devices(self):
+        # Enumerating audio devices takes ~100ms; cache briefly so opening
+        # the menu (which evaluates both labels) scans only once.
+        now = time.monotonic()
+        if now - self._devices_at > 2.0:
+            self._devices_cache = current_devices()
+            self._devices_at = now
+        return self._devices_cache
+
+    def _mic_label(self, _item):
+        return f"Mic: {self._devices()[0]}"
+
+    def _out_label(self, _item):
+        return f"Out: {self._devices()[1]}"
+
     def _build_menu_items(self):
         items = [
+            pystray.MenuItem(self._mic_label, None, enabled=False),
+            pystray.MenuItem(self._out_label, None, enabled=False),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._toggle_label, self.on_toggle, default=True),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._choose_key_label, self.on_choose_key),
