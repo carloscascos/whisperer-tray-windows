@@ -1,5 +1,13 @@
 import ctypes
 import sys
+from pathlib import Path as _Path
+
+# Allow running with the base interpreter directly (no venv activation):
+# the uv venv's pythonw.exe is a trampoline that spawns console python.exe,
+# which flashes a Windows Terminal window the app cannot hide.
+_site = _Path(__file__).parent / ".venv" / "Lib" / "site-packages"
+if _site.is_dir() and str(_site) not in sys.path:
+    sys.path.insert(0, str(_site))
 
 if sys.platform == "win32":
     _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -15,6 +23,7 @@ import math
 import os
 import re
 import struct
+import subprocess
 import threading
 import time
 import tkinter as tk
@@ -82,6 +91,14 @@ _TIC_WAV = (
     _make_tone_wav(420, 200, attack_ms=60, lead_ms=500, tail_ms=80, lead_volume=80)
     if sys.platform == "win32" else b""
 )
+# Long low buzz: the recording was discarded or failed — nothing was pasted.
+# Immediate feedback so a long dictation is never lost silently.
+_ERR_WAV = (
+    _make_tone_wav(170, 500, attack_ms=20, release_ms=120, lead_ms=500,
+                   tail_ms=80, lead_volume=80)
+    if sys.platform == "win32" else b""
+)
+
 # The stop cue plays while the headset is switching back from hands-free to
 # music mode, whose endpoint re-activation pops: longer quiet lead and a
 # slower fade-in absorb it. (Fallback path only — normally the stop cue goes
@@ -166,6 +183,9 @@ MAX_RECORDING_SEC = _env_float("WHISPERER_MAX_RECORDING_SEC", 300.0)
 # dropped. The start cue must play BEFORE the mic opens; the stop cue must
 # wait until the headset has switched back, which takes over a second.
 TOC_DELAY_SEC = _env_float("WHISPERER_TOC_DELAY_SEC", 0.6)
+# Below this: silence/background (icon blue). Between this and MIN_RMS:
+# audible but too quiet to pass the gate (icon red — speech being lost).
+NOISE_RMS = _env_float("WHISPERER_NOISE_RMS", max(20.0, MIN_RMS * 0.4))
 
 LANGUAGE = os.environ.get("WHISPERER_LANGUAGE", "es")
 PROMPT = os.environ.get("WHISPERER_PROMPT", "")
@@ -463,6 +483,11 @@ class Recorder:
         self._sample_count = 0
         self._was_headset = False
         self._lock = threading.Lock()
+        # Live level feedback: on_level(0|1|2) fires on band changes —
+        # 0 silence/background, 1 audible-but-below-gate, 2 voice registering.
+        self.on_level = None
+        self._level = 0
+        self._level_t = 0.0
 
     def _pick_input_device(self):
         """Choose the input device for this recording, hot-plug aware.
@@ -500,6 +525,8 @@ class Recorder:
             _play_sync(_TIC_WAV)
             self._frames = []
             self._sample_count = 0
+            self._level = 0
+            self._level_t = 0.0
             try:
                 self._stream = self._open_stream(device_index)
             except Exception as e:
@@ -551,7 +578,37 @@ class Recorder:
             if self._sample_count >= self._MAX_SAMPLES:
                 log(f"recording cap hit: {MAX_RECORDING_SEC}s")
                 _play_async(_TOC_WAV)
+        self._update_voice(audioop.rms(in_data, 2))
         return (in_data, pyaudio.paContinue)
+
+    def _update_voice(self, rms):
+        if rms >= MIN_RMS:
+            level = 2
+        elif rms >= NOISE_RMS:
+            level = 1
+        else:
+            level = 0
+        # Upgrade immediately; downgrade only after 0.4s, so the indicator
+        # stays steady across natural word gaps instead of flickering.
+        now = time.monotonic()
+        if level >= self._level:
+            self._level_t = now
+            if level > self._level:
+                self._level = level
+                self._notify_level(level)
+        elif now - self._level_t > 0.4:
+            self._level = level
+            self._level_t = now
+            self._notify_level(level)
+
+    def _notify_level(self, level):
+        cb = self.on_level
+        if cb is None:
+            return
+        try:
+            cb(level)
+        except Exception as e:
+            log(f"on_level callback failed: {e!r}")
 
     def stop(self):
         frames = None
@@ -566,6 +623,7 @@ class Recorder:
             self._stream.stop_stream()
             self._stream.close()
             self._stream = None
+            self._level = 0
             frames = self._frames
         if not toc_played:
             _play_async(
@@ -592,11 +650,23 @@ def transcribe_and_paste(frames, language, model, on_text=None):
     if duration < MIN_DURATION_SEC:
         log(f"skip transcribe: too short ({duration:.2f}s)")
         return
+    # Gate on the loudest 0.5s window, not the whole-take average: a long
+    # quiet dictation with pauses averages below threshold even though the
+    # speech itself is fine, and Whisper handles quiet speech well.
+    window = int(SAMPLE_RATE * 2 * CHANNELS * 0.5)
+    peak = max(
+        audioop.rms(raw[off:off + window], 2)
+        for off in range(0, len(raw), window)
+    )
     rms = audioop.rms(raw, 2)
-    if rms < MIN_RMS:
-        log(f"skip transcribe: too quiet (rms={rms}, dur={duration:.2f}s)")
+    if peak < MIN_RMS:
+        log(f"skip transcribe: too quiet (peak={peak}, rms={rms}, dur={duration:.2f}s)")
+        _play_async(_ERR_WAV)
         return
-    log(f"to API: dur={duration:.2f}s rms={rms} lang={language or 'auto'} model={model}")
+    log(
+        f"to API: dur={duration:.2f}s rms={rms} peak={peak} "
+        f"lang={language or 'auto'} model={model}"
+    )
     wav_bytes = build_wav(raw)
     try:
         api_kwargs = {
@@ -636,6 +706,9 @@ def transcribe_and_paste(frames, language, model, on_text=None):
         if text and is_hallucination(text):
             log(f"skip transcribe: hallucination {text!r}")
             text = ""
+        if not text:
+            log("nothing pasted (all segments dropped)")
+            _play_async(_ERR_WAV)
         if text:
             text = apply_replacements(text)
             if on_text is not None:
@@ -650,13 +723,21 @@ def transcribe_and_paste(frames, language, model, on_text=None):
                 time.sleep(0.2)
                 pyperclip.copy(prev_clipboard)
     except Exception as e:
+        log(f"transcription error: {e!r}")
         print(f"Transcription error: {e}", file=sys.stderr)
+        _play_async(_ERR_WAV)
 
 
 ACTIVE_COLOR = (40, 200, 80, 255)
 PAUSED_COLOR = (140, 140, 140, 255)
 CAPTURING_COLOR = (240, 180, 40, 255)
-RECORDING_COLOR = (220, 50, 50, 255)
+# While recording, the icon is a live level meter:
+#   blue  = recording, only silence/background noise (nothing being lost)
+#   green = voice above MIN_RMS is registering ("I can hear you")
+#   red   = audible sound BELOW MIN_RMS — speech is being lost, speak up
+RECORDING_COLOR = (0, 140, 255, 255)
+VOICE_COLOR = (60, 220, 80, 255)
+LOSING_COLOR = (220, 50, 50, 255)
 
 
 ICON_SIZE = 256
@@ -702,6 +783,9 @@ _ACTIVE_ICON = _make_icon(ACTIVE_COLOR, slashed=False)
 _PAUSED_ICON = _make_icon(PAUSED_COLOR, slashed=True)
 _CAPTURING_ICON = _make_icon(CAPTURING_COLOR, slashed=False)
 _RECORDING_ICON = _make_icon(RECORDING_COLOR, slashed=False)
+_VOICE_ICON = _make_icon(VOICE_COLOR, slashed=False)
+_LOSING_ICON = _make_icon(LOSING_COLOR, slashed=False)
+_LEVEL_ICONS = {0: _RECORDING_ICON, 1: _LOSING_ICON, 2: _VOICE_ICON}
 
 
 def make_icon(active):
@@ -785,6 +869,7 @@ class TrayApp:
         self._devices_cache = ("?", "?")
         self._devices_at = 0.0
         self.recorder = Recorder()
+        self.recorder.on_level = self._on_level
         self._tk = TkBackend()
         self.icon = WhispererIcon(
             "groq_whisperer",
@@ -822,6 +907,7 @@ class TrayApp:
             pystray.MenuItem(self._out_label, None, enabled=False),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._toggle_label, self.on_toggle, default=True),
+            pystray.MenuItem("Restart Whisperer", self.on_restart),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(self._choose_key_label, self.on_choose_key),
         ]
@@ -942,20 +1028,31 @@ class TrayApp:
     def on_press(self, _event):
         if not self.enabled:
             return
-        self.recorder.start()
+        # Icon first, then start: recording callbacks repaint the icon with
+        # the live voice level, and must not be overwritten afterwards.
         try:
             self.icon.icon = _RECORDING_ICON
         except Exception:
             pass
+        self.recorder.start()
+
+    def _on_level(self, level):
+        log(f"level -> {('silence', 'losing', 'voice')[level]}")
+        try:
+            self.icon.icon = _LEVEL_ICONS[level]
+        except Exception as e:
+            log(f"level icon update failed: {e!r}")
 
     def on_release(self, _event):
         if not self.enabled:
             return
+        # Stop first, icon after: a late audio callback during shutdown
+        # could otherwise repaint the icon green and leave it stuck.
+        frames = self.recorder.stop()
         try:
             self.icon.icon = make_icon(self.enabled)
         except Exception:
             pass
-        frames = self.recorder.stop()
         if frames:
             model = MODEL_TURBO if self.turbo else MODEL_NORMAL
             threading.Thread(
@@ -1030,6 +1127,21 @@ class TrayApp:
                 log(f"capture: update_menu failed: {e!r}")
             self._capturing = False
             log(f"capture: end (active={self.trigger_key!r})")
+
+    def on_restart(self, icon, _item):
+        """Full process restart, so every .env setting is re-read."""
+        log("restart requested from tray menu")
+        self.recorder.stop()
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve())],
+                cwd=str(Path(__file__).parent),
+                close_fds=True,
+            )
+        except Exception as e:
+            log(f"restart failed to spawn: {e!r}")
+            return
+        icon.stop()
 
     def on_quit(self, icon, _item):
         self.recorder.stop()
